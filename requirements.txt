@@ -1,0 +1,36 @@
+# ---- Core data stack ----
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14.0            # fast parquet I/O for large merged frames
+
+# ---- Statistics ----
+scipy>=1.11
+statsmodels>=0.14
+
+# ---- Machine learning ----
+scikit-learn>=1.3
+shap>=0.44               # SHAP values for interpretation (task #9)
+
+# ---- Visualization ----
+matplotlib>=3.7
+seaborn>=0.13
+plotly>=5.18
+
+# ---- Geospatial (for mapping) ----
+# geopandas>=0.14
+# folium>=0.15             # interactive choropleth maps
+# mapclassify>=2.6         # quantile/jenks binning for choropleths
+
+# ---- Data source APIs ----
+requests>=2.31
+census>=0.8              # thin wrapper over the Census API
+fredapi>=0.5             # FRED API client
+
+# ---- Utilities ----
+python-dotenv>=1.0       # load CENSUS_API_KEY / FRED_API_KEY from .env
+tqdm>=4.66               # progress bars on long downloads
+openpyxl>=3.1            # read HUD .xlsx files
+
+# ---- Notebook environment ----
+jupyterlab>=4.0
+ipykernel>=6.29

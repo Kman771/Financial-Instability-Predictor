@@ -1,0 +1,722 @@
+================================================================================
+  DATA DIVE — SPRING 2026
+  Illinois Neighborhood Financial Instability Early Warning System
+  Plain-English Walkthrough: What We Did, What Data We Used, How We Cleaned It
+================================================================================
+
+Written to help you understand every step the code takes, in order.
+
+--------------------------------------------------------------------------------
+OVERVIEW
+--------------------------------------------------------------------------------
+
+The project answers one question:
+  "Can we predict which Illinois ZIP codes will become financially unstable
+   in the NEXT year, using data we already have THIS year?"
+
+The unit of analysis is a ZCTA (ZIP Code Tabulation Area) — think of it as a
+ZIP code. Illinois has about 1,400 of them. We track each one from 2015 to 2022,
+so our dataset is roughly 1,400 ZIPs × 8 years = ~11,000 rows before cleaning.
+
+The pipeline has 5 stages:
+  1. Data Collection    — download raw data from 5 sources
+  2. Data Cleaning      — standardize, compute rates, fix missing values
+  3. Feature Engineering — merge sources, build predictive features
+  4. Modeling           — train 3 classifiers, evaluate on held-out year
+  5. Interpretation     — figure out which features actually matter
+
+
+================================================================================
+STAGE 1 — DATA COLLECTION  (src/data_collection.py, Notebook 01)
+================================================================================
+
+We pulled from 5 public sources. Here is what each one is and why we used it.
+
+--------------------------------------------------------------------------------
+Source 1: U.S. Census ACS 5-Year Estimates
+  File saved to: data/raw/acs5_zcta_{year}.parquet  (one file per year)
+  What it is:
+    The American Community Survey is the Census Bureau's annual detailed survey.
+    The "5-year" version averages 5 years of responses, which gives more reliable
+    numbers for small areas like ZIP codes. We pulled the version at ZCTA geography
+    (the Census name for ZIP-code-level areas).
+  Why we used it:
+    It's the best public source for income, poverty, rent, unemployment, and
+    education at the ZIP level. No other free source has this detail.
+  What we downloaded:
+    For each year 2015–2022, we called the Census API and pulled 14 variables:
+      - B01003_001E  → total population
+      - B19013_001E  → median household income (dollars per year)
+      - B17001_001E  → poverty universe (people counted in poverty calculation)
+      - B17001_002E  → people below poverty line
+      - B23025_003E  → labor force (people 16+ who can work)
+      - B23025_005E  → unemployed people
+      - B25064_001E  → median gross rent (dollars per month)
+      - B15003_001E  → education universe (people 25+)
+      - B15003_022E  → people with a bachelor's degree
+      - B15003_023E  → people with a master's degree
+      - B15003_024E  → people with a professional degree
+      - B15003_025E  → people with a doctorate
+      - B25010_001E  → average household size
+      - B01002_001E  → median age
+  How we filtered to Illinois:
+    We asked the API for "zip code tabulation area:* in state:17" (17 is
+    Illinois's FIPS code). For years where that didn't work, we downloaded all
+    U.S. ZIPs and kept only ones starting with 600–629 (Illinois ZIP prefix range).
+  Note on negative values:
+    The Census uses -666666666 as a suppression code meaning "too few people
+    to report safely." We replaced all negative numbers with NaN (blank).
+
+--------------------------------------------------------------------------------
+Source 2: HUD Fair Market Rent (FMR)
+  File saved to: data/raw/hud_fmr_{year}.xlsx  (one file per year)
+  What it is:
+    The U.S. Department of Housing and Urban Development publishes a "Fair Market
+    Rent" number for every county each year. It's the HUD estimate of what a
+    modest 2-bedroom apartment should cost in that area. It's used to set
+    housing voucher amounts.
+  Why we used it:
+    It gives us a county-level rent benchmark. We compare each ZIP's actual
+    median rent (from ACS) to the HUD FMR to get a "rent vs. market" ratio.
+    A ZIP where rents are far above FMR is a warning sign.
+  What happened with the downloads:
+    HUD's website requires going through a portal — it blocked automated
+    downloads and returned empty files. We generated synthetic FMR values
+    that are realistic for Illinois counties (range ~$700–$2,200/month for
+    a 2BR, with ~2.5% annual growth, and higher values for Cook County and
+    the collar counties around Chicago).
+
+--------------------------------------------------------------------------------
+Source 3: HUD USPS ZIP-to-County Crosswalk
+  File saved to: data/raw/hud_zip_county_xwalk.xlsx
+  What it is:
+    A mapping table that says "ZIP code 60637 is 80% in Cook County and 20%
+    in DuPage County." It comes from USPS address data and is published
+    quarterly by HUD.
+  Why we needed it:
+    Some data (evictions, FMR) is only available at the county level.
+    To attach it to ZIPs, we need to know which ZIPs are in which counties
+    and what fraction of each ZIP belongs to each county.
+  Key column — res_ratio:
+    This is the residential ratio: the fraction of residential addresses in
+    that ZIP that fall in that county. We use it as a weight when averaging
+    county data down to the ZIP level.
+
+--------------------------------------------------------------------------------
+Source 4: Eviction Lab — County-Level Data
+  File saved to: data/raw/eviction_lab/counties.csv
+  What it is:
+    Princeton's Eviction Lab collected court records on eviction filings
+    across the U.S. The county-level dataset covers 2000–2018. It tells
+    us how many eviction filings happened in each county each year, and
+    how many renting households there were.
+  Why we used it:
+    Eviction filing rates are one of the four signals in our instability
+    score. A rising eviction rate is a direct, measurable sign of housing
+    financial stress.
+  What the actual columns looked like (not what we expected):
+    We expected pre-computed rates but got raw counts:
+      - fips_county   → 5-digit county FIPS code (e.g. 17031 = Cook County)
+      - year          → year
+      - renting_hh    → number of renting households
+      - filings_observed → number of eviction filings
+    We computed the filing rate ourselves: filings_observed / renting_hh
+
+--------------------------------------------------------------------------------
+Source 5: CFPB Consumer Complaint Database
+  File saved to: data/raw/cfpb_complaints_by_zip_year.parquet
+  What it is:
+    The Consumer Financial Protection Bureau publishes every complaint it
+    receives about financial products (mortgages, credit cards, debt
+    collection, etc.). The full file is about 1GB zipped.
+  Why we used it:
+    Complaint volume is a proxy for financial stress. When people in a
+    neighborhood are struggling with debt collectors or predatory loans,
+    complaints go up — often before evictions do.
+  How we handled the large file:
+    We streamed it in 200,000-row chunks instead of loading it all at once.
+    For each chunk we:
+      1. Parsed the date
+      2. Kept only Illinois complaints (State == "IL")
+      3. Extracted the 5-digit ZIP from the "ZIP code" column
+      4. Counted complaints per (ZIP, year)
+    The final saved file is tiny (~25KB) because we aggregated down to counts.
+
+--------------------------------------------------------------------------------
+Source 6: FRED Macroeconomic Series
+  File saved to: data/raw/fred_macro.parquet
+  What it is:
+    The Federal Reserve Bank of St. Louis publishes economic time series.
+    We pulled three Illinois-specific series:
+      - ILUR      → Illinois monthly unemployment rate (seasonally adjusted)
+      - CPIAUCSL  → National Consumer Price Index (inflation measure)
+      - ILSTHPI   → Illinois House Price Index (FHFA all-transactions)
+  Why we used it:
+    Individual ZIP-level data doesn't capture statewide economic conditions.
+    When the whole state's unemployment rises (like in 2020), that context
+    matters for predicting instability.
+
+
+================================================================================
+STAGE 2 — DATA CLEANING  (src/cleaning.py, Notebook 02)
+================================================================================
+
+Each source gets its own cleaning function. Here is what each one does.
+
+--------------------------------------------------------------------------------
+clean_acs(years)  →  saves to data/processed/acs_panel.parquet
+
+Step 1 — Load and concatenate
+  Read the 8 yearly parquets and stack them into one big table.
+  Result: ~11,090 rows (about 1,398 ZIPs × 8 years).
+
+Step 2 — Compute derived rates
+  The ACS gives us raw counts, not rates. We compute:
+
+  poverty_rate       = below_poverty_count / poverty_universe
+                       (fraction of people below the poverty line)
+
+  unemployment_rate  = unemployed / labor_force_16plus
+                       (fraction of workers who are unemployed)
+
+  bachelors_plus_rate = (bachelors + masters + professional + doctorate)
+                        / education_universe_25plus
+                       (fraction of adults 25+ with at least a bachelor's)
+
+  rent_burden        = (median_gross_rent × 12) / median_household_income
+                       (annual rent as a fraction of annual household income)
+                       e.g. rent_burden = 0.35 means rent takes 35% of income.
+                       Note: median_gross_rent is monthly, income is annual,
+                       so we multiply rent by 12 first.
+
+Step 3 — Sentinel cleanup
+  Clip any rate below 0 or above 1 to NaN. (Rates can't be negative or over 100%.)
+  These show up sometimes when Census suppression codes weren't caught earlier.
+
+Step 4 — Tiny ZCTA flag
+  Add a boolean column is_tiny_zcta = True if population < 500.
+  We do NOT drop these ZIPs — we just flag them so analysts know to be careful.
+
+Step 5 — Standardize geography
+  Make sure zcta is always a 5-character zero-padded string (e.g. "06101" not "6101").
+
+Step 6 — drop_missing_core()
+  Drop any row missing any of these 6 "core" variables:
+    total_population, median_household_income, poverty_rate,
+    unemployment_rate, median_gross_rent, rent_burden
+  We report exactly how many rows were dropped and which variable was missing most.
+  In our run: ~1,474 rows dropped mainly due to missing median_gross_rent
+  (small ZIPs where Census suppresses rent data for privacy).
+  Final ACS panel: ~9,616 rows.
+
+--------------------------------------------------------------------------------
+clean_hud_fmr(year)  →  saves to data/processed/hud_fmr.parquet
+
+  Reads each year's Excel file.
+  Detects the FIPS column (looks for "fips", "fips2010", "fipscode" in column names).
+  Detects the 2BR FMR column (looks for "fmr_2", "fmr2", "2-br", etc.).
+  Filters to keep only Illinois counties (FIPS starting with "17").
+  Outputs: (county_fips, year, fmr_2br) — one row per Illinois county per year.
+
+  Added guard: if a file is 0 bytes (empty), skip it and warn — this prevents
+  a silent crash when placeholder files exist.
+
+--------------------------------------------------------------------------------
+clean_hud_crosswalk()  →  saves to data/processed/zcta_county_xwalk.parquet
+
+  Reads the single crosswalk Excel file.
+  Standardizes column names (lowercase, strip spaces).
+  Zero-pads both zcta and county_fips to 5 digits.
+  Converts res_ratio, bus_ratio, tot_ratio to numeric.
+  Output: one row per (ZIP, county) pair — a ZIP that touches 3 counties
+  has 3 rows, with res_ratio weights that sum to ~1.0 across those rows.
+
+--------------------------------------------------------------------------------
+clean_eviction_lab()  →  saves to data/processed/eviction_lab_county.parquet
+
+  Searches for counties.csv in data/raw/eviction_lab/.
+  Reads it and normalizes column names (lowercase, replace dashes with underscores).
+  Detects schema: if fips_county column exists (the actual file format),
+    → county_fips = fips_county zero-padded to 5 digits
+    → eviction_filing_rate = filings_observed / renting_hh
+    → eviction_rate = eviction_filing_rate × 0.45
+       (court judgments are roughly 45% of filings historically)
+  Filters to Illinois counties only (FIPS starting with "17").
+  Result: 119 rows (Cook County only had data, years ~2001–2018).
+
+--------------------------------------------------------------------------------
+clean_cfpb()  →  saves to data/processed/cfpb_by_zcta_year.parquet
+
+  Simple load — the heavy lifting was done during download.
+  Standardizes zcta as 5-digit string, year as int.
+  Result: (zcta, year, n_complaints) — counts per ZIP per year.
+
+--------------------------------------------------------------------------------
+clean_fred()  →  saves to data/processed/fred_annual.parquet
+
+  Reads the long-format parquet (date, series_id, value).
+  Extracts the year from date.
+  Computes annual mean for each series (averaging across months).
+  Pivots from long to wide: one row per year, one column per series.
+  Renames to short lowercase names: ilur, cpi, ilsthpi.
+
+--------------------------------------------------------------------------------
+add_moratorium_flag(df)
+
+  Adds a boolean column moratorium_year = True for years 2020 and 2021.
+  Applied to every cleaned source that has a year column.
+  Reason: the CDC eviction moratorium (Sept 2020 – Aug 2021) suppressed
+  eviction filings. Without this flag, the model would think 2020–2021
+  were unusually stable — but they weren't, evictions were just legally blocked.
+
+
+================================================================================
+STAGE 3 — FEATURE ENGINEERING  (src/features.py, Notebook 03)
+================================================================================
+
+This is where all 5 cleaned sources get merged into one master table,
+and the prediction target gets constructed.
+
+--------------------------------------------------------------------------------
+Step 1 — County → ZIP rollup  (weighted_rollup_county_to_zcta)
+
+  Eviction rates and FMR are county-level. We need them at ZIP level.
+
+  For each (ZIP, year), we compute a weighted average of the county values,
+  using res_ratio (residential ratio) as the weight:
+
+    zip_value = sum(res_ratio_c × county_value_c) / sum(res_ratio_c)
+                for all counties c that ZIP touches
+
+  Example: if ZIP 60637 is 90% Cook County and 10% DuPage County,
+  and Cook has eviction_rate=0.04, DuPage has eviction_rate=0.02, then:
+    zip_eviction_rate = (0.9×0.04 + 0.1×0.02) / (0.9 + 0.1) = 0.038
+
+  If a county has a NaN value, it's skipped (only non-missing counties
+  contribute to the weighted average).
+
+--------------------------------------------------------------------------------
+Step 2 — Merge all sources  (build_master_panel)
+
+  Start with the ACS panel (ZIP × year).
+  Left-join CFPB complaint counts on (zcta, year).
+  Left-join FMR (ZIP-level after rollup) on (zcta, year).
+  Left-join eviction rates (ZIP-level after rollup) on (zcta, year).
+  Left-join FRED macro data on (year) — same value for all ZIPs in a year.
+
+  complaint_rate_per_10k = n_complaints / (total_population / 10,000)
+  (standardizes complaints by population so big cities don't dominate)
+
+--------------------------------------------------------------------------------
+Step 3 — Year-over-year and 3-year change features  (add_derived_features)
+
+  For each ZIP, sorted by year, we compute how things changed:
+
+  rent_growth_yoy           = (rent_this_year - rent_last_year) / rent_last_year
+  unemployment_change_yoy   = unemployment_this_year - unemployment_last_year
+  income_growth_yoy         = (income_this - income_last) / income_last
+  complaint_growth_yoy      = (complaints_this - complaints_last) / complaints_last
+
+  3-year versions (smoother, less noisy because ACS is a rolling 5-year average):
+  rent_growth_3yr           = (rent_this - rent_3_years_ago) / rent_3_years_ago
+  unemployment_change_3yr   = unemployment_this - unemployment_3_years_ago
+
+  Rent vs. market:
+  rent_vs_fmr_ratio         = median_gross_rent / fmr_2br
+  (>1.0 means this ZIP's rents are above the HUD benchmark for the area)
+
+  FRED-derived annual changes:
+  cpi_yoy_change            = year-over-year % change in national CPI
+  hpi_yoy_change            = year-over-year % change in Illinois house price index
+
+--------------------------------------------------------------------------------
+Step 4 — Target construction  (build_instability_score + add_lagged_target)
+
+  This is the most important design decision in the project.
+
+  4 target signals (the things that directly measure financial distress):
+    1. eviction_filing_rate   — are people being evicted?
+    2. rent_burden            — are rents unaffordable relative to income?
+    3. poverty_rate           — are people below the poverty line?
+    4. complaint_rate_per_10k — are people filing financial complaints?
+
+  For each signal, within each year, we z-score it:
+    z = (value - mean_that_year) / std_that_year
+  This makes the score RELATIVE — a ZIP is "unstable" compared to other
+  Illinois ZIPs that year, not compared to some absolute threshold.
+
+  financial_instability_score = average of the 4 z-scores
+  (requires at least 3 of 4 signals to be present; otherwise NaN)
+
+  unstable = 1 if financial_instability_score is in the top 25% for that year
+           = 0 otherwise
+  (by construction, about 25% of ZIPs are flagged each year)
+
+  unstable_next_year = unstable shifted forward 1 year within each ZIP
+  This is what we PREDICT. Features from year t predict this label for t+1.
+  The last year (2022) has no next-year label, so those rows are used only
+  as features to predict 2023.
+
+--------------------------------------------------------------------------------
+Final master panel stats:
+  Shape: 9,586 rows × 35 columns
+  ZCTAs: 1,277 unique ZIP codes
+  Years: 2015–2022
+  Target balance: exactly 25.0% unstable (as designed)
+  Features used in modeling: 17 columns (see Stage 4)
+
+
+================================================================================
+STAGE 4 — MODELING  (src/modeling.py + src/evaluation.py, Notebook 04)
+================================================================================
+
+--------------------------------------------------------------------------------
+The time-aware split
+
+  We split by year — NOT randomly. This is critical.
+
+  Training set: all ZCTA-years where year < 2021
+    → years 2015, 2016, 2017, 2018, 2019, 2020
+    → 7,153 rows
+
+  Test set: all ZCTA-years where year = 2021
+    → 1,156 rows
+
+  Why not random split?
+  If we randomly shuffled rows, 2021 data from ZIP A could end up in training
+  while 2020 data from ZIP A ends up in test. The model would "know" the future
+  of specific ZIPs. Time-aware splitting simulates the real deployment scenario:
+  train on history, predict the future.
+
+--------------------------------------------------------------------------------
+The 17 features used
+
+  Core levels (6):
+    median_household_income  — annual income in dollars
+    poverty_rate             — fraction below poverty line (0–1)
+    unemployment_rate        — fraction unemployed (0–1)
+    rent_burden              — annual rent / annual income (0–1)
+    bachelors_plus_rate      — fraction of adults with bachelor's+ (0–1)
+    complaint_rate_per_10k   — CFPB complaints per 10,000 residents
+
+  Year-over-year changes (4):
+    rent_growth_yoy          — % rent change from last year
+    unemployment_change_yoy  — unemployment rate change from last year
+    income_growth_yoy        — % income change from last year
+    complaint_growth_yoy     — % complaint change from last year
+
+  3-year trends (2):
+    rent_growth_3yr          — % rent change over 3 years (smoother)
+    unemployment_change_3yr  — unemployment change over 3 years
+
+  Market comparison (1):
+    rent_vs_fmr_ratio        — ZIP median rent / HUD benchmark rent
+
+  Macro context (3):
+    state_unemployment_rate  — Illinois monthly unemployment (from FRED ILUR)
+    hpi_yoy_change           — Illinois house price index YoY change
+    cpi_yoy_change           — national CPI YoY change (inflation)
+
+  Flag (1):
+    moratorium_year          — True for 2020 and 2021
+
+--------------------------------------------------------------------------------
+Model 1: Logistic Regression  (baseline)
+
+  What it does:
+    Fits a linear decision boundary in feature space. Each feature gets a
+    coefficient — positive means it pushes toward "unstable", negative means
+    it pushes toward "stable".
+
+  Preprocessing inside the pipeline:
+    1. Impute missing values with the median of each feature (training set medians)
+    2. Scale all features to zero mean / unit variance (so coefficients are comparable)
+    3. Fit logistic regression with class_weight='balanced', max_iter=2000
+
+  class_weight='balanced' means: since only 25% of rows are positive (unstable),
+  the model automatically up-weights mistakes on the positive class to compensate.
+  Without this, the model would just predict "stable" for everything and get 75%
+  accuracy without learning anything useful.
+
+  Test results:
+    Recall:    100.0%   (caught every single unstable ZIP — 0 misses)
+    Precision:  26.1%   (but flagged 827 stable ZIPs as unstable)
+    ROC-AUC:    0.960
+    Accuracy:   28.5%   (low because it over-flags)
+
+  Interpretation:
+    The model is very aggressive. It would rather flag everything than miss one.
+    Good if your goal is "never miss a struggling neighborhood."
+    Bad if resources are very limited and false alarms are costly.
+
+--------------------------------------------------------------------------------
+Model 2: Random Forest  (best overall)
+
+  What it does:
+    Builds 300 decision trees, each trained on a random subset of rows and
+    features. Final prediction is the majority vote across all trees.
+    Each tree asks a series of yes/no questions (e.g., "is poverty_rate > 0.25?")
+    and routes each ZIP to a leaf node with a predicted class.
+
+  Preprocessing inside the pipeline:
+    1. Impute missing values with median (Random Forest can't handle NaN)
+    2. No scaling needed — trees don't care about feature scale
+
+  Settings:
+    n_estimators=300 (300 trees), min_samples_leaf=5 (each leaf needs ≥5 rows,
+    prevents overfitting), class_weight='balanced', random_state=42
+
+  Test results:
+    Recall:    81.2%   (missed 55 unstable ZIPs out of 292)
+    Precision: 84.6%   (when it flagged a ZIP, it was right 85% of the time)
+    F1:        82.9%   (harmonic mean of precision and recall — best overall)
+    ROC-AUC:   0.964   (best of the three models)
+    Accuracy:  91.5%
+
+  This is the recommended model for deployment.
+
+--------------------------------------------------------------------------------
+Model 3: Gradient Boosting  (HistGradientBoosting)
+
+  What it does:
+    Builds trees sequentially — each new tree tries to correct the mistakes
+    of the previous ones. "Hist" version bins features into histograms first,
+    making it much faster on large datasets.
+
+  Key difference from Random Forest:
+    Random Forest builds trees independently in parallel (bagging).
+    Gradient Boosting builds trees one at a time, each correcting the last (boosting).
+
+  Settings:
+    learning_rate=0.08, max_iter=400, class_weight='balanced', random_state=42
+    NaN handling: native — no imputation needed
+
+  Test results:
+    Recall:    80.5%
+    Precision: 83.6%
+    F1:        82.0%
+    ROC-AUC:   0.953
+    Accuracy:  91.1%
+
+  Very close to Random Forest. Slightly lower on every metric.
+
+--------------------------------------------------------------------------------
+Why ROC-AUC of 0.96 is strong
+
+  ROC-AUC measures how well the model separates unstable from stable ZIPs
+  across ALL possible decision thresholds (not just 0.5).
+  0.5 = random guessing. 1.0 = perfect separation.
+  0.964 means the model correctly ranks 96.4% of (unstable, stable) pairs —
+  nearly always assigns a higher probability to the truly unstable ZIP.
+
+
+================================================================================
+STAGE 5 — INTERPRETATION  (src/evaluation.py, Notebook 05)
+================================================================================
+
+--------------------------------------------------------------------------------
+Logistic Regression Coefficients
+
+  After scaling, the coefficients tell us the direction and strength of each
+  feature's effect on the log-odds of being unstable:
+
+  Top positive (push toward UNSTABLE):
+    rent_burden              +2.14   (strongest predictor — high rent burden → unstable)
+    poverty_rate             +1.74   (second strongest)
+    complaint_rate_per_10k   +0.66
+    moratorium_year          +0.44   (2020/21 flagged as higher base risk)
+    bachelors_plus_rate      +0.40   (surprising direction — discussed below)
+
+  Top negative (push toward STABLE):
+    state_unemployment_rate  -0.38   (high state unemployment → stable? See note)
+    median_household_income  -0.32   (higher income → more stable)
+
+  Note on bachelors_plus_rate being positive:
+    This seems counterintuitive (more education = more unstable?). It likely
+    reflects gentrification: ZIPs gaining educated residents often see rapid
+    rent increases that price out existing lower-income residents.
+
+  Note on state_unemployment_rate being negative:
+    The model learned that years with higher state unemployment (2020–2021)
+    coincided with the moratorium — when eviction signals were suppressed.
+    The moratorium_year flag already captures this, so the model uses
+    state_unemployment_rate to partially account for "suppressed instability."
+
+--------------------------------------------------------------------------------
+Permutation Importance (Random Forest and Gradient Boosting)
+
+  Permutation importance works by randomly shuffling one feature's values
+  and measuring how much the model's accuracy drops. A big drop = important feature.
+  A small drop = the model didn't really rely on that feature.
+
+  Both tree models agreed on the top features:
+    1. rent_burden            — shuffling this hurts the most
+    2. poverty_rate           — second most important
+    3. complaint_rate_per_10k — third
+    4. unemployment_rate      — fourth
+
+  The agreement between the logistic regression coefficients and the tree-based
+  permutation importances is a robustness check — two completely different
+  model families pointing at the same features gives us confidence.
+
+--------------------------------------------------------------------------------
+Risk Ranking
+
+  Using the best model (Random Forest), we predict the probability of instability
+  for each ZIP using its 2022 features. These probabilities represent our best
+  estimate of which ZIPs will be in financial distress in 2023.
+
+  Top 10 at-risk ZIPs for 2023:
+    Rank 1:  61602 — Peoria (central)
+    Rank 2:  60637 — Chicago, Woodlawn
+    Rank 3:  60636 — Chicago, West Englewood
+    Rank 4:  60621 — Chicago, West Garfield Park
+    Rank 5:  60624 — Chicago, Austin
+    Rank 6:  60141 — Hines / Maywood area
+    Rank 7:  60653 — Chicago, Douglas / Bronzeville
+    Rank 8:  60615 — Chicago, Hyde Park area
+    Rank 9:  60644 — Chicago, Austin (western portion)
+    Rank 10: 60619 — Chicago, Calumet Heights
+
+  All of these are South and West Side Chicago neighborhoods and Peoria —
+  historically underinvested areas with high poverty and rent burden.
+  This geographic clustering is a sanity check that the model learned something
+  real about financial vulnerability in Illinois.
+
+
+================================================================================
+BUGS FIXED DURING THIS SESSION
+================================================================================
+
+Bug 1 — cleaning.py: backward-compatibility override
+  Problem: A leftover code block was overriding the correct rent_burden formula
+  with an old formula (rent_pct_of_income / 100) whenever old synthetic data
+  was present. This would silently produce wrong rent_burden values.
+  Fix: Removed the override block. The correct formula
+  (median_gross_rent × 12) / median_household_income now always applies.
+
+Bug 2 — cleaning.py: empty file crash
+  Problem: HUD FMR xlsx files were 0 bytes (failed downloads). pandas crashed
+  with "Excel file format cannot be determined" when trying to read them.
+  Fix: Added a file size check — if the file is 0 bytes, skip it and warn.
+
+Bug 3 — cleaning.py: Eviction Lab schema mismatch
+  Problem: The cleaner expected columns named "GEOID", "eviction-rate",
+  "eviction-filing-rate". The actual CSV has "fips_county", "filings_observed",
+  "renting_hh" with raw counts instead of pre-computed rates.
+  Fix: Rewrote the cleaner to detect the actual schema, build county_fips from
+  fips_county, and compute rates from the raw counts.
+
+Bug 4 — Environment: wrong Python architecture
+  Problem: The only registered Jupyter kernel pointed to an x86_64-compiled
+  Python 3.11 with matplotlib. On this ARM64 (Apple Silicon) Mac, the
+  matplotlib C extension failed to load with "incompatible architecture."
+  Fix: Created a new virtual environment at .venv/ using the ARM64 slice of
+  the universal Python binary, installed all requirements there, and registered
+  it as the "data-dive" Jupyter kernel.
+
+Bug 5 — HUD FMR downloads returning empty files
+  Problem: HUD's download portal requires browser-session authentication.
+  Programmatic downloads returned 0-byte files with HTTP 202 status.
+  Fix: Generated synthetic HUD FMR data (realistic Illinois county-level rents
+  with ~2.5%/year growth, higher values for Cook and collar counties) and wrote
+  them as properly formatted xlsx files that the cleaner can parse.
+
+
+================================================================================
+FILE MAP — WHERE EVERYTHING LIVES
+================================================================================
+
+data/
+  raw/
+    acs5_zcta_{year}.parquet     — raw ACS data, one file per year 2015–2022
+    hud_fmr_{year}.xlsx          — HUD Fair Market Rent per county per year
+    hud_zip_county_xwalk.xlsx    — ZIP-to-county mapping with residential ratios
+    eviction_lab/counties.csv    — Eviction Lab county-level filing data
+    cfpb_complaints_by_zip_year.parquet  — CFPB complaints aggregated to ZIP-year
+    fred_macro.parquet           — FRED macro time series (monthly, long format)
+
+  processed/
+    acs_panel.parquet            — cleaned ACS, all years stacked, rates computed
+    hud_fmr.parquet              — cleaned FMR, county × year
+    zcta_county_xwalk.parquet    — cleaned crosswalk, ZIP × county with weights
+    eviction_lab_county.parquet  — cleaned eviction rates, county × year
+    cfpb_by_zcta_year.parquet    — cleaned complaint counts, ZIP × year
+    fred_annual.parquet          — FRED series collapsed to annual means, wide format
+    master_panel.parquet         — fully merged and engineered panel, ready for modeling
+
+src/
+  data_collection.py    — downloads raw data from all 5 sources
+  cleaning.py           — one cleaner per source, drop_missing_core logic
+  features.py           — weighted rollup, feature engineering, target construction
+  modeling.py           — model factories (logistic, RF, HGB), time-aware split
+  evaluation.py         — metrics (recall-first), comparison table, threshold tuning
+  visualization.py      — all plotting functions (EDA, model comparison, interpretation)
+  generate_all_outputs.py  — runs the full pipeline end-to-end, saves all figures/tables
+  build_presentation.py    — builds the 14-slide PPTX from outputs/ figures
+
+outputs/
+  figures/
+    eda_01_score_distribution.png         — histogram of financial instability score
+    eda_02_unstable_share_over_time.png   — % unstable per year (should be ~25%)
+    eda_03_stable_vs_unstable_kde.png     — feature distributions by class
+    eda_04_correlation_heatmap.png        — feature correlation matrix
+    eda_05_top_correlations.png           — bar chart of top correlations with target
+    interp_01_logistic_coefs.png          — logistic regression coefficients
+    interp_02_rf_permutation_importance.png  — RF permutation importance
+    interp_03_gb_permutation_importance.png  — GB permutation importance
+    model_01_comparison_recall.png        — model recall comparison bar chart
+    model_02_comparison_roc_auc.png       — model ROC-AUC comparison bar chart
+    model_03_confusion_logistic_regression.png — confusion matrix
+
+  models/
+    logistic_regression.joblib    — saved trained logistic regression pipeline
+    random_forest.joblib          — saved trained random forest pipeline
+    gradient_boosting.joblib      — saved trained gradient boosting pipeline
+
+  tables/
+    model_performance.csv         — recall, precision, F1, AUC for all 3 models
+    logistic_coefficients.csv     — feature coefficients from logistic regression
+    random_forest_permutation_importance.csv
+    gradient_boosting_permutation_importance.csv
+    feature_target_correlations.csv
+    risk_ranking_next_year.csv    — top predicted-risk ZIPs for 2023
+    run_summary.json              — summary of the run (panel shape, metrics, top-10)
+
+presentation/
+  data_dive_presentation.pptx    — 14-slide final deck (built by build_presentation.py)
+  final_slide_outline.md         — slide-by-slide content plan
+
+notebooks/
+  01_data_collection.ipynb       — runs all downloads
+  02_data_cleaning.ipynb         — runs all cleaners, saves processed parquets
+  03_eda.ipynb                   — exploratory analysis, builds master panel, EDA plots
+  04_modeling.ipynb              — trains models, evaluates, saves results
+  05_interpretation.ipynb        — feature importance, SHAP, risk ranking
+
+
+================================================================================
+HOW TO RE-RUN EVERYTHING FROM SCRATCH
+================================================================================
+
+  # Activate the arm64 virtual environment
+  source .venv/bin/activate
+
+  # Step 1 — Download raw data (needs CENSUS_API_KEY and FRED_API_KEY in .env)
+  jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.kernel_name=data-dive notebooks/01_data_collection.ipynb
+
+  # Steps 2-5 — Clean, EDA, Model, Interpret
+  jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.kernel_name=data-dive notebooks/02_data_cleaning.ipynb
+  jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.kernel_name=data-dive notebooks/03_eda.ipynb
+  jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.kernel_name=data-dive notebooks/04_modeling.ipynb
+  jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.kernel_name=data-dive notebooks/05_interpretation.ipynb
+
+  # Or run the whole pipeline in one script (skips notebooks, faster)
+  python src/generate_all_outputs.py
+
+  # Rebuild the presentation
+  python src/build_presentation.py
+
+================================================================================
+END OF WALKTHROUGH
+================================================================================
